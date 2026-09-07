@@ -37,6 +37,45 @@ agent_scopes:
     deny: [delete_invoices]
 `)
 
+var internalMergePolicy = []byte(`
+version: "1.0"
+rules:
+  - id: policy-deny
+    match: read_policy_deny
+    decision: deny
+    reason: policy-deny-wins
+
+  - id: policy-allow
+    match: delete_policy_allow
+    decision: allow
+    reason: policy-allows
+
+  - id: confidence-deny-policy-review
+    match: read_confidence_deny
+    decision: human_review
+    reason: policy-requests-review
+
+  - id: all-review
+    match: delete_all_review
+    decision: human_review
+    reason: policy-review-tie
+
+  - id: three-levels
+    match: read_three_levels
+    decision: human_review
+    reason: policy-review-wins
+
+  - id: compute-redirect
+    match: delete_compute_redirect
+    decision: compute
+    reason: policy-compute-redirect
+    safe_tool: read_safe_alternative
+    safe_args: {}
+
+roles: {}
+agent_scopes: {}
+`)
+
 func newDecisionHandler(t *testing.T, confCfg ConfidenceConfig) *Handler {
 	t.Helper()
 	clearRiskEnv(t)
@@ -167,6 +206,109 @@ func TestEvaluateAgentDecision_HardDeny(t *testing.T) {
 	assert.False(t, res.allowed)
 	assert.False(t, res.requiresReview)
 	assert.Equal(t, "denied", res.outcome)
+}
+
+func TestEvaluateAgentDecision_MergePrecedence(t *testing.T) {
+	tests := []struct {
+		name               string
+		action             string
+		confidence         float64
+		wantOutcome        string
+		wantAllowed        bool
+		wantRequiresReview bool
+		wantReasonContains string
+	}{
+		{
+			name:               "policy deny overrides confidence review",
+			action:             "read_policy_deny",
+			confidence:         0.80,
+			wantOutcome:        "denied",
+			wantAllowed:        false,
+			wantRequiresReview: false,
+			wantReasonContains: "policy-deny-wins",
+		},
+		{
+			name:               "risk review overrides policy allow",
+			action:             "delete_policy_allow",
+			confidence:         0.95,
+			wantOutcome:        "review",
+			wantAllowed:        false,
+			wantRequiresReview: true,
+			wantReasonContains: "risk score",
+		},
+		{
+			name:               "confidence deny overrides policy review",
+			action:             "read_confidence_deny",
+			confidence:         0.40,
+			wantOutcome:        "denied",
+			wantAllowed:        false,
+			wantRequiresReview: false,
+			wantReasonContains: "request blocked",
+		},
+		{
+			name:               "confidence reason wins equal review outcomes",
+			action:             "delete_all_review",
+			confidence:         0.80,
+			wantOutcome:        "review",
+			wantAllowed:        false,
+			wantRequiresReview: true,
+			wantReasonContains: "confidence 80% requires human approval",
+		},
+		{
+			name:               "policy review wins three different outcomes",
+			action:             "read_three_levels",
+			confidence:         0.60,
+			wantOutcome:        "review",
+			wantAllowed:        false,
+			wantRequiresReview: true,
+			wantReasonContains: "policy-review-wins",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newDecisionHandler(t, ConfidenceConfig{
+				AllowUnverifiedConfidence: true,
+			})
+			require.NoError(t, h.eval.LoadPolicyBytes(internalMergePolicy))
+
+			res, handled, _ := evaluate(t, h, agentAuthorizeRequest{
+				Actor:      "merge_bot",
+				Action:     tt.action,
+				Confidence: f64(tt.confidence),
+			})
+
+			require.False(t, handled)
+			assert.Equal(t, tt.wantOutcome, res.outcome)
+			assert.Equal(t, tt.wantAllowed, res.allowed)
+			assert.Equal(t, tt.wantRequiresReview, res.requiresReview)
+			assert.Contains(t, res.resp.Reason, tt.wantReasonContains)
+		})
+	}
+}
+
+func TestEvaluateAgentDecision_ComputeSuppressedByRiskReview(t *testing.T) {
+	h := newDecisionHandler(t, ConfidenceConfig{
+		AllowUnverifiedConfidence: true,
+	})
+	require.NoError(t, h.eval.LoadPolicyBytes(internalMergePolicy))
+
+	res, handled, _ := evaluate(t, h, agentAuthorizeRequest{
+		Actor:      "merge_bot",
+		Action:     "delete_compute_redirect",
+		Confidence: f64(0.95),
+	})
+
+	require.False(t, handled)
+	assert.False(t, res.allowed)
+	assert.True(t, res.requiresReview)
+	assert.Equal(t, "review", res.outcome)
+
+	// The policy supplied a safe redirect, but the risk decision requires
+	// review, so the redirect must not become active.
+	assert.Equal(t, "read_safe_alternative", res.resp.SafeTool)
+	assert.False(t, res.resp.Compute)
+	assert.Contains(t, res.resp.Reason, "risk score")
 }
 
 func TestEvaluateAgentDecision_MissingSignalFailsClosed(t *testing.T) {
