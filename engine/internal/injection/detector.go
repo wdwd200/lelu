@@ -14,6 +14,8 @@ import (
 	"math"
 	"strings"
 	"unicode"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // ─── Patterns ─────────────────────────────────────────────────────────────────
@@ -95,14 +97,28 @@ var structuralIndicators = []string{
 	"without restriction",
 }
 
-// homoglyphMap maps common unicode lookalikes to ASCII equivalents.
+// homoglyphMap maps unicode lookalikes to their ASCII skeleton, following the
+// single-script confusable mappings in UTS #39. It covers only what NFKC cannot:
+// script confusables are canonically distinct, so U+043E CYRILLIC SMALL LETTER O
+// and friends survive normalization unchanged and need this table. Compatibility
+// forms (fullwidth, math-styled, ligatures) are handled by NFKC in
+// normalizeConfusables and are deliberately not listed here.
+//
+// Long term this is worth generating from the UTS #39 confusables.txt data file
+// rather than maintaining by hand.
 var homoglyphMap = map[rune]rune{
-	'і': 'i', 'ο': 'o', 'е': 'e', 'а': 'a', 'с': 'c',
-	'р': 'p', 'х': 'x', 'у': 'y', 'ј': 'j', 'ԁ': 'd',
+	// Cyrillic
+	'а': 'a', 'в': 'b', 'с': 'c', 'ԁ': 'd', 'е': 'e',
+	'н': 'h', 'і': 'i', 'ј': 'j', 'к': 'k', 'ӏ': 'l',
+	'м': 'm', 'о': 'o', 'р': 'p', 'ѕ': 's', 'т': 't',
+	'ѵ': 'v', 'х': 'x', 'у': 'y',
+	// Greek
+	'α': 'a', 'ε': 'e', 'ι': 'i', 'κ': 'k', 'ο': 'o',
+	'ρ': 'p', 'τ': 't', 'υ': 'u', 'ν': 'v',
+	// Latin small capitals and other Latin variants
 	'ɡ': 'g', 'ʜ': 'h', 'ᴋ': 'k', 'ʟ': 'l', 'ᴍ': 'm',
 	'ɴ': 'n', 'ǫ': 'q', 'ʀ': 'r', 'ꜱ': 's', 'ᴛ': 't',
-	'ᴠ': 'v', 'ᴡ': 'w', 'ᴢ': 'z', 'ﬁ': 'f', 'ﬂ': 'f',
-	'０': '0', '１': '1', '２': '2', '３': '3', '４': '4',
+	'ᴠ': 'v', 'ᴡ': 'w', 'ᴢ': 'z',
 }
 
 // ─── Result ───────────────────────────────────────────────────────────────────
@@ -244,12 +260,11 @@ func fullScan(text, source string) Result {
 		}
 	}
 
-	// Layer 2: normalize homoglyphs and re-scan.
-	normalized := normalizeHomoglyphs(text)
-	if normalized != text {
-		lowerNorm := strings.ToLower(normalized)
+	// Layer 2: fold confusables and re-scan.
+	normalized := normalizeConfusables(text)
+	if normalized != lower {
 		for _, p := range exactPatterns {
-			if strings.Contains(lowerNorm, p) {
+			if strings.Contains(normalized, p) {
 				return Result{
 					Detected: true,
 					Pattern:  p,
@@ -261,29 +276,39 @@ func fullScan(text, source string) Result {
 		}
 	}
 
-	// Layer 3: fuzzy match (Levenshtein distance ≤ 2 on word n-grams).
-	if r := fuzzyMatch(lower, source); r.Detected {
+	// Layer 3: fuzzy match (Levenshtein distance ≤ 2 on word n-grams) over the
+	// folded text, so a confusable substitution combined with a typo is still
+	// reachable. Reading raw input here leaves that combination invisible to
+	// every layer: layer 2 misses it because of the typo, and the substitutions
+	// spend the fuzzy edit budget before the typo is considered.
+	if r := fuzzyMatch(normalized, source); r.Detected {
 		return r
 	}
 
 	return Result{}
 }
 
-// normalizeHomoglyphs replaces unicode lookalikes with ASCII equivalents.
-func normalizeHomoglyphs(s string) string {
+// normalizeConfusables folds a string toward its ASCII skeleton for detection
+// and returns it lowercased.
+//
+// NFKC runs first and covers the compatibility classes — fullwidth forms,
+// math-styled letters, ligatures. It does nothing for script confusables, which
+// are canonically distinct: U+043E CYRILLIC SMALL LETTER O is NFKC-stable, so
+// homoglyphMap does that half. The two are complementary, not alternatives.
+//
+// Case folding happens after NFKC and before the table lookup so that uppercase
+// confusables (U+041E CYRILLIC CAPITAL LETTER O) reach the map as their
+// lowercase form instead of passing through unmapped.
+func normalizeConfusables(s string) string {
+	folded := strings.ToLower(norm.NFKC.String(s))
 	var b strings.Builder
-	b.Grow(len(s))
-	changed := false
-	for _, r := range s {
+	b.Grow(len(folded))
+	for _, r := range folded {
 		if mapped, ok := homoglyphMap[r]; ok {
 			b.WriteRune(mapped)
-			changed = true
 		} else {
 			b.WriteRune(r)
 		}
-	}
-	if !changed {
-		return s
 	}
 	return b.String()
 }
