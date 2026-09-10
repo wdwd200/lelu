@@ -470,6 +470,10 @@ const (
 	// Once the hot cache is full, a missing actor may be genuinely new or may
 	// have been evicted with negative history. Do not silently restore the
 	// favourable 1.0 default in that ambiguous state.
+	//
+	// Note: this narrows but does not eliminate reputation reset. An actor that
+	// earned a score below 0.5 and then forces its own eviction returns at 0.5.
+	// Closing that fully needs history outside the process.
 	conservativeUnknownReliability = 0.5
 
 	// A conservative prior used when an unknown actor enters a full cache.
@@ -619,15 +623,27 @@ func (s *actorStats) record(actor string, outcome decisionOutcome) {
 }
 
 func (s *actorStats) evictOldestLocked() {
-	elem := s.lru.Back()
-	if elem == nil {
+	const maxScan = 8
+
+	// Prefer evicting an actor with no denial history. Bad reputation should be
+	// sticky under pressure: an attacker wanting to shed a poor score then has
+	// to fill the cache with their own denied actors, which is self-limiting.
+	victim := s.lru.Back()
+	if victim == nil {
 		return
 	}
 
-	entry := elem.Value.(*actorStatEntry)
+	for elem, n := victim, 0; elem != nil && n < maxScan; elem, n = elem.Prev(), n+1 {
+		if elem.Value.(*actorStatEntry).denies == 0 {
+			victim = elem
+			break
+		}
+	}
+
+	entry := victim.Value.(*actorStatEntry)
 
 	delete(s.entries, entry.key)
-	s.lru.Remove(elem)
+	s.lru.Remove(victim)
 
 	actorStatePressureTotal.WithLabelValues("actor_stats", "evict").Inc()
 

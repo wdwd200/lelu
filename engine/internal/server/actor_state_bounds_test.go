@@ -32,10 +32,11 @@ func TestActorStatsEvictedBadActorDoesNotResetToOne(t *testing.T) {
 	stats := newActorStatsWithCapacity(2, 2)
 
 	stats.record("bad", outcomeDeny)
-	stats.record("good-a", outcomeAllow)
+	stats.record("other-bad", outcomeDeny)
 
-	// Force the oldest actor ("bad") out.
-	stats.record("good-b", outcomeAllow)
+	// With no clean eviction candidate, fall back to evicting the true oldest
+	// entry. The evicted bad actor must still not regain reliability 1.0.
+	stats.record("incoming", outcomeDeny)
 
 	if _, ok := stats.entries[actorKey("bad")]; ok {
 		t.Fatal("bad actor unexpectedly remained in hot cache")
@@ -65,6 +66,32 @@ func TestActorStatsEvictedBadActorDoesNotResetToOne(t *testing.T) {
 
 	if got == 1.0 {
 		t.Fatal("evicted bad actor silently reset to reliability 1.0")
+	}
+}
+
+func TestActorStatsPrefersEvictingCleanEntry(t *testing.T) {
+	stats := newActorStatsWithCapacity(3, 3)
+
+	stats.record("bad-oldest", outcomeDeny)
+	stats.record("clean", outcomeAllow)
+	stats.record("bad-newest", outcomeDeny)
+
+	// The true LRU entry is bad-oldest, but a clean entry exists within the
+	// bounded scan, so the clean entry should be evicted instead.
+	stats.record("incoming", outcomeDeny)
+
+	if _, ok := stats.entries[actorKey("bad-oldest")]; !ok {
+		t.Fatal("bad oldest actor was evicted despite a clean candidate")
+	}
+
+	cleanKey := actorKey("clean")
+
+	if _, ok := stats.entries[cleanKey]; ok {
+		t.Fatal("clean actor unexpectedly remained in hot cache")
+	}
+
+	if _, ok := stats.trusted[cleanKey]; !ok {
+		t.Fatal("evicted clean actor was not retained in trusted cache")
 	}
 }
 
